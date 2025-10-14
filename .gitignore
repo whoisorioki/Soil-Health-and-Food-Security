@@ -114,6 +114,9 @@ data/external/**
 !data/processed/*_validation_report.txt
 !data/processed/*_quality_report.txt
 
+# Exclude large raw Atlas files (processed versions are kept)
+data/raw/atlas_exposure_ha_vop_crops.csv
+
 # Large dataset files
 *.tif
 *.tiff

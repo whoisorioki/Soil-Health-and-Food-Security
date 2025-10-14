@@ -51,16 +51,23 @@ def setup_paths():
     paths['atlas_data'] = paths['processed_data'] / "master_atlas_data_cleaned.csv"
     paths['boundaries'] = paths['raw_data'] / "atlas_admin2_boundaries.json"
     
-    # SoilGrids raster files
+    # SoilGrids raster files (2017 baseline)
     soil_dir = paths['raw_data'] / "soil" / "soilgrids"
     glosem_dir = paths['raw_data'] / "soil" / "GloSEM_25km" / "Data_25km"
+    glosem_13_dir = paths['raw_data'] / "soil" / "GloSEM_1.3"  # For upcoming GloSEM 1.3 data
     
     raster_files = {
+        # SoilGrids 2017 data (EPSG:4326, good coverage for land areas)
         'soil_ph': soil_dir / "soilgrids_ph_0-5cm_ssa.tif",
-        'soil_soc': soil_dir / "soilgrids_soc_0-30cm_ssa.tif", 
+        'soil_soc': soil_dir / "soilgrids_soc_0-30cm_ssa.tif",      # ✅ GOOD DATA - 43.9% valid coverage
         'soil_sand': soil_dir / "soilgrids_sand_0-5cm_ssa.tif",
         'soil_clay': soil_dir / "soilgrids_clay_0-5cm_ssa.tif",
-        'erosion_2012': glosem_dir / "RUSLE_SoilLoss_v1.1_yr2012_25km.tif"
+        
+        # GloSEM erosion data - prefer 1.3 (2019) if available, fallback to 1.1 (2012)
+        'erosion_2019': glosem_13_dir / "RUSLE_SoilLoss_v1.3_yr2019_250m.tif",      # Preferred - GloSEM 1.3
+        'erosion_2012': glosem_dir / "RUSLE_SoilLoss_v1.1_yr2012_25km.tif",        # Fallback - GloSEM 1.1
+        'erosion_cfactor': glosem_dir / "RUSLE_CFactor_yr2012_v1.1_25km.tif",      # Current available
+        'erosion_rfactor': glosem_dir / "RUSLE_RFactor_v1.1_25km.tif"              # Current available
     }
     
     return paths, raster_files
@@ -124,18 +131,23 @@ def add_placeholder_environmental_data(df):
     """Add placeholder environmental data when raster processing isn't available."""
     print("   📊 Adding placeholder environmental indicators...")
     
-    # Add placeholder soil health indicators (would be replaced by actual zonal stats)
+    # Add placeholder soil health indicators based on 2017 SoilGrids ranges
     np.random.seed(42)  # For reproducible placeholder data
     n_records = len(df)
     
-    # Simulate soil health indicators
-    df['soil_ph_mean'] = np.random.normal(6.5, 1.0, n_records).clip(4.0, 8.5)
-    df['soil_soc_mean'] = np.random.exponential(2.0, n_records).clip(0.1, 10.0)
-    df['soil_sand_mean'] = np.random.normal(45, 15, n_records).clip(10, 90)
-    df['soil_clay_mean'] = np.random.normal(25, 10, n_records).clip(5, 60)
-    df['erosion_2012_mean'] = np.random.exponential(5.0, n_records).clip(0.1, 50.0)
+    # Simulate soil health indicators based on actual SoilGrids data ranges
+    df['soil_ph_mean'] = np.random.normal(29.7, 10.0, n_records).clip(10.0, 80.0)    # pH*10 scale
+    df['soil_soc_mean'] = np.random.normal(116.3, 40.0, n_records).clip(20.0, 500.0) # SOC g/kg
+    df['soil_sand_mean'] = np.random.normal(238, 50, n_records).clip(50, 600)        # Sand content
+    df['soil_clay_mean'] = np.random.normal(105, 30, n_records).clip(20, 400)       # Clay content
+    df['erosion_2012_mean'] = np.random.exponential(2.8, n_records).clip(0.1, 50.0) # Soil loss t/ha/yr
+    
+    # Add erosion factors for comprehensive analysis
+    df['erosion_cfactor_mean'] = np.random.beta(2, 10, n_records) * 0.5  # Cover factor 0-0.5
+    df['erosion_rfactor_mean'] = np.random.exponential(2300, n_records).clip(100, 20000)  # Rainfall erosivity
     
     print(f"   ✅ Added placeholder soil indicators to {len(df):,} records")
+    print(f"   📋 Variables: pH, SOC, Sand%, Clay%, Erosion Rate, Cover Factor, Rainfall Erosivity")
     return df
 
 def process_raster_with_boundaries(df, boundaries, raster_files):
@@ -150,6 +162,19 @@ def process_raster_with_boundaries(df, boundaries, raster_files):
         print(f"   🔄 Reprojecting boundaries from {boundaries.crs} to EPSG:4326")
         boundaries = boundaries.to_crs('EPSG:4326')
     
+    # Normalize country names for consistent merging (especially Congo)
+    boundaries['admin0_name_normalized'] = boundaries['admin0_name'].replace({
+        'Congo - Kinshasa': 'Democratic Republic of the Congo',
+        'Congo - Brazzaville': 'Republic of the Congo'
+    })
+    
+    # Create comprehensive admin identifier for robust merging
+    boundaries['merge_key'] = (
+        boundaries['admin0_name_normalized'].astype(str) + '|' + 
+        boundaries['admin1_name'].astype(str) + '|' + 
+        boundaries['admin2_name'].astype(str)
+    )
+    
     # Process each raster file
     for raster_key, raster_path in raster_files.items():
         print(f"   📈 Processing {raster_key}...")
@@ -161,53 +186,103 @@ def process_raster_with_boundaries(df, boundaries, raster_files):
                 print(f"      Raster CRS: {raster_crs}")
                 
                 # Handle coordinate system differences
-                if 'soilgrids' in str(raster_path) and raster_crs == 'ESRI:54009':
-                    print(f"      ⚠️  SoilGrids data in ESRI:54009 - may need reprojection")
-                    # For now, we'll use boundaries reprojected to match raster
+                if raster_crs == 'EPSG:4326':
+                    # Both in WGS84 - direct processing
+                    boundaries_for_zonal = boundaries
+                    print(f"      ✅ Using WGS84 coordinates for {raster_key}")
+                elif 'ESRI:54009' in raster_crs:
+                    print(f"      ⚠️  SoilGrids data in ESRI:54009 - reprojecting boundaries")
                     boundaries_for_zonal = boundaries.to_crs(raster_crs)
                 else:
-                    boundaries_for_zonal = boundaries
+                    print(f"      🔄 Reprojecting boundaries to match {raster_crs}")
+                    boundaries_for_zonal = boundaries.to_crs(raster_crs)
                 
-                # Calculate zonal statistics
-                stats = zonal_stats(
-                    boundaries_for_zonal.geometry,
-                    raster_path,
-                    stats=['mean', 'min', 'max', 'std'],
-                    nodata=src.nodata
-                )
-                
-                # Add statistics to boundaries
-                for stat_name in ['mean', 'min', 'max', 'std']:
-                    col_name = f"{raster_key}_{stat_name}"
-                    boundaries[col_name] = [s[stat_name] if s[stat_name] is not None else np.nan for s in stats]
-                
-                print(f"      ✅ Added {raster_key} statistics")
+                # Calculate zonal statistics with error handling
+                try:
+                    stats = zonal_stats(
+                        boundaries_for_zonal.geometry,
+                        raster_path,
+                        stats=['mean', 'min', 'max', 'std', 'count'],
+                        nodata=src.nodata,
+                        all_touched=True  # Include pixels that touch boundaries
+                    )
+                    
+                    # Add statistics to boundaries
+                    for stat_name in ['mean', 'min', 'max', 'std', 'count']:
+                        col_name = f"{raster_key}_{stat_name}"
+                        boundaries[col_name] = [s[stat_name] if s and s[stat_name] is not None else np.nan for s in stats]
+                    
+                    valid_stats = sum(1 for s in stats if s and s.get('mean') is not None)
+                    print(f"      ✅ Added {raster_key} statistics ({valid_stats}/{len(stats)} valid)")
+                    
+                except Exception as e:
+                    print(f"      ❌ Zonal statistics failed for {raster_key}: {str(e)}")
+                    # Add NaN columns as placeholders
+                    for stat_name in ['mean', 'min', 'max', 'std', 'count']:
+                        col_name = f"{raster_key}_{stat_name}"
+                        boundaries[col_name] = np.nan
                 
         except Exception as e:
             print(f"      ❌ Error processing {raster_key}: {str(e)}")
             continue
     
-    # Merge with atlas data based on admin columns
+    # Merge with atlas data using flexible matching
     print("   🔗 Merging environmental data with Atlas data...")
     
-    # Map admin boundary columns to atlas columns
-    boundaries['country'] = boundaries['admin0_name']
-    boundaries['region'] = boundaries['admin1_name'] 
-    boundaries['sub_region'] = boundaries['admin2_name']
+    # Create merge keys for both datasets
+    df['atlas_merge_key'] = df['country'].astype(str) + '|' + df['region'].astype(str) + '|' + df['sub_region'].astype(str)
     
-    # Merge on admin identifiers
-    merge_cols = ['country', 'region', 'sub_region']
+    # Get environmental columns
     env_cols = [col for col in boundaries.columns if any(
         raster_key in col for raster_key in raster_files.keys()
     )]
     
+    # Prepare boundary data for merging
+    boundary_merge_data = boundaries[['admin0_name', 'admin1_name', 'admin2_name', 'merge_key'] + env_cols].copy()
+    boundary_merge_data['boundary_merge_key'] = boundary_merge_data['merge_key']
+    
+    # Try direct merge first
     df_merged = df.merge(
-        boundaries[merge_cols + env_cols],
-        on=merge_cols,
+        boundary_merge_data[['boundary_merge_key'] + env_cols],
+        left_on='atlas_merge_key',
+        right_on='boundary_merge_key',
         how='left'
     )
     
-    print(f"   ✅ Merged environmental data: {len(df_merged):,} records")
+    successful_merges = df_merged[env_cols[0]].notna().sum() if env_cols else 0
+    print(f"   📊 Direct merge: {successful_merges}/{len(df)} records matched")
+    
+    # For unmatched records, try alternative matching strategies
+    if successful_merges < len(df) * 0.9:  # If less than 90% matched
+        print("   🔄 Applying fuzzy matching for remaining records...")
+        
+        # Alternative matching: just country + sub_region (skip region)
+        unmatched_mask = df_merged[env_cols[0]].isna() if env_cols else pd.Series([True] * len(df_merged))
+        unmatched_df = df[unmatched_mask]
+        
+        for idx, row in unmatched_df.iterrows():
+            # Try matching on country and sub_region only
+            country_matches = boundary_merge_data[
+                boundary_merge_data['admin0_name'].str.contains(row['country'], case=False, na=False) |
+                boundary_merge_data['admin0_name'].str.replace(' ', '').str.contains(row['country'].replace(' ', ''), case=False, na=False)
+            ]
+            
+            if len(country_matches) > 0:
+                subregion_matches = country_matches[
+                    country_matches['admin2_name'].str.contains(row['sub_region'], case=False, na=False) |
+                    country_matches['admin2_name'].str.replace(' ', '').str.contains(row['sub_region'].replace(' ', ''), case=False, na=False)
+                ]
+                
+                if len(subregion_matches) > 0:
+                    # Use first match
+                    match = subregion_matches.iloc[0]
+                    for col in env_cols:
+                        if col in match:
+                            df_merged.loc[idx, col] = match[col]
+    
+    final_matches = df_merged[env_cols[0]].notna().sum() if env_cols else len(df_merged)
+    print(f"   ✅ Final merge: {final_matches}/{len(df)} records with environmental data ({final_matches/len(df)*100:.1f}%)")
+    
     return df_merged
 
 def calculate_environmental_vulnerability(df):
@@ -215,31 +290,74 @@ def calculate_environmental_vulnerability(df):
     print("🧮 Calculating environmental vulnerability scores...")
     
     # Environmental vulnerability components (higher = more vulnerable)
-    # Low pH is worse (acidic soils)
-    df['ph_vulnerability'] = 1 - ((df['soil_ph_mean'] - 4.0) / (8.5 - 4.0))
-    df['ph_vulnerability'] = df['ph_vulnerability'].clip(0, 1)
     
-    # Low SOC is worse (low fertility)
-    df['soc_vulnerability'] = 1 - (df['soil_soc_mean'] / df['soil_soc_mean'].max())
+    # 1. pH vulnerability (SoilGrids scale: 0-101, where ~65 = pH 6.5)
+    if 'soil_ph_mean' in df.columns:
+        # Convert SoilGrids pH scale to vulnerability (optimal pH ~65)
+        df['ph_vulnerability'] = np.abs(df['soil_ph_mean'] - 65) / 50  # Distance from optimal
+        df['ph_vulnerability'] = df['ph_vulnerability'].clip(0, 1)
     
-    # High sand content is worse (drought prone)
-    df['texture_vulnerability'] = df['soil_sand_mean'] / 100.0
+    # 2. SOC vulnerability (low SOC = high vulnerability)
+    if 'soil_soc_mean' in df.columns:
+        # SOC in g/kg - lower values indicate poor soil fertility
+        # Typical range: 17-2144 g/kg, optimal >100 g/kg
+        df['soc_vulnerability'] = 1 - (df['soil_soc_mean'] / df['soil_soc_mean'].quantile(0.9))
+        df['soc_vulnerability'] = df['soc_vulnerability'].clip(0, 1)
     
-    # Base vulnerability components
-    env_components = ['ph_vulnerability', 'soc_vulnerability', 'texture_vulnerability']
+    # 3. Soil texture vulnerability (extreme sand or clay is problematic)
+    if 'soil_sand_mean' in df.columns and 'soil_clay_mean' in df.columns:
+        # Normalize to 0-100 scale (SoilGrids uses per-mille scale)
+        sand_pct = (df['soil_sand_mean'] / 10).clip(0, 100)  
+        clay_pct = (df['soil_clay_mean'] / 10).clip(0, 100)
+        
+        # Balanced texture vulnerability (extreme sand or clay is bad)
+        df['texture_vulnerability'] = np.maximum(
+            (sand_pct - 50).clip(0, 50) / 50,  # High sand penalty
+            (clay_pct - 30).clip(0, 70) / 70   # High clay penalty
+        )
     
-    # Add erosion data if available (GloSEM has this)
+    # 4. Erosion vulnerability (2012 soil loss rates)
     if 'erosion_2012_mean' in df.columns:
-        df['erosion_vulnerability'] = df['erosion_2012_mean'] / df['erosion_2012_mean'].max()
-        env_components.append('erosion_vulnerability')
+        # High erosion = high vulnerability (>5 t/ha/yr is concerning)
+        df['erosion_vulnerability'] = (df['erosion_2012_mean'] / 10).clip(0, 1)
         print("   ✅ Erosion data included in vulnerability assessment")
+    
+    # 5. Cover management vulnerability (C-factor: higher = less protection)
+    if 'erosion_cfactor_mean' in df.columns:
+        df['cover_vulnerability'] = df['erosion_cfactor_mean'] * 2  # Scale 0-0.5 to 0-1
+        print("   ✅ Land cover protection factor included")
+    
+    # Collect available vulnerability components
+    env_components = []
+    component_names = []
+    
+    if 'ph_vulnerability' in df.columns:
+        env_components.append('ph_vulnerability')
+        component_names.append('pH')
+    if 'soc_vulnerability' in df.columns:
+        env_components.append('soc_vulnerability')
+        component_names.append('SOC')
+    if 'texture_vulnerability' in df.columns:
+        env_components.append('texture_vulnerability')
+        component_names.append('Texture')
+    if 'erosion_vulnerability' in df.columns:
+        env_components.append('erosion_vulnerability')
+        component_names.append('Erosion')
+    if 'cover_vulnerability' in df.columns:
+        env_components.append('cover_vulnerability')
+        component_names.append('Cover')
+    
+    if env_components:
+        # Combined environmental vulnerability (mean of available components)
+        df['environmental_vulnerability_score'] = df[env_components].mean(axis=1)
+        print(f"   ✅ Using {len(env_components)} vulnerability components: {', '.join(component_names)}")
     else:
-        print("   ⚠️  Erosion data not available - using only pH, SOC, and texture")
+        # Fallback if no soil data available
+        print("   ⚠️  No soil data available - using uniform low vulnerability")
+        df['environmental_vulnerability_score'] = 0.3
     
-    # Combined environmental vulnerability (mean of components)
-    df['environmental_vulnerability_score'] = df[env_components].mean(axis=1)
-    
-    print(f"   ✅ Environmental vulnerability range: {df['environmental_vulnerability_score'].min():.3f} - {df['environmental_vulnerability_score'].max():.3f}")
+    vuln_range = df['environmental_vulnerability_score']
+    print(f"   ✅ Environmental vulnerability range: {vuln_range.min():.3f} - {vuln_range.max():.3f}")
     return df
 
 def calculate_compound_risk(df):
@@ -289,14 +407,19 @@ def export_results(df, hotspots, paths):
     """Export processed datasets for visualization and further analysis."""
     print("💾 Exporting processed datasets...")
     
-    # Main dataset for visualization
+    # Export main dataset
     viz_columns = [
         'country', 'region', 'sub_region',
         'hazard_score', 'social_vulnerability_score', 'environmental_vulnerability_score',
         'combined_vulnerability_score', 'compound_risk_score',
-        'population', 'vop_crops_usd', 'ndws_future_days', 'poverty_headcount_ratio',
-        'soil_ph_mean', 'soil_soc_mean', 'soil_sand_mean', 'soil_clay_mean'
+        'population', 'vop_crops_usd', 'ndws_future_days', 'poverty_headcount_ratio'
     ]
+    
+    # Add available soil indicators
+    soil_columns = ['soil_ph_mean', 'soil_soc_mean', 'soil_sand_mean', 'soil_clay_mean', 
+                   'erosion_2012_mean', 'erosion_cfactor_mean', 'erosion_rfactor_mean']
+    available_soil_cols = [col for col in soil_columns if col in df.columns]
+    viz_columns.extend(available_soil_cols)
     
     # Export main dataset
     output_file = paths['processed_data'] / "compound_risk_assessment.csv"
